@@ -1,356 +1,265 @@
 # Real-Time Home Monitoring & Event Detection System
 
-An end-to-end home monitoring system integrating real-time video streaming, pose-based event detection, a Flask backend, and an Android application for remote monitoring and alert notifications.
+An end-to-end monitoring prototype that connects **live video streaming**, **pose-based event detection**, a **Python / Flask backend**, and an **Android client** for event history and configurable notifications.
 
-**Tech Stack:** `Java` · `Python` · `Flask` · `MediaPipe` · `OpenCV` · `RTSP` · `LibVLC` · `OkHttp` · `Android`
+**Tech Stack:** `Java` · `Android` · `Python` · `Flask` · `MediaPipe Pose` · `OpenCV` · `RTSP` · `LibVLC` · `OkHttp` · `JSON`
 
----
+> **Project context:** Team capstone project. My primary contributions focused on **Android development and end-to-end integration**, including RTSP playback, backend communication, alert history, notification filtering, and Android notifications.
 
-## Overview
+## Contents
 
-This project was developed as a real-time home monitoring system that combines video streaming, human pose analysis, event detection, backend communication, and mobile alerting into a complete monitoring pipeline.
+- [Project Overview](#project-overview)
+- [System Architecture](#system-architecture)
+- [End-to-End Data Flow](#end-to-end-data-flow)
+- [Event Detection](#event-detection)
+- [Android Alert Processing](#android-alert-processing)
+- [Component Design](#component-design)
+- [API and Technology Choices](#api-and-technology-choices)
+- [Build and Configuration](#build-and-configuration)
+- [Engineering Trade-offs and Limitations](#engineering-trade-offs-and-limitations)
+- [Repository Structure](#repository-structure)
+- [Contributions](#contributions)
 
-The system consists of two main components:
+## Project Overview
 
-* **Python / Flask Backend** — captures and processes video frames, performs MediaPipe-based pose estimation and rule-based event detection, and exposes detected alerts through HTTP endpoints.
-* **Android Application** — displays a live RTSP video stream, periodically retrieves alerts from the Flask backend, maintains recent alert history, and generates Android system notifications.
+This project integrates camera capture, pose analysis, rule-based detection, network communication, and mobile alert presentation into a monitoring workflow. Its primary engineering focus is **cross-component integration**, rather than any single standalone classifier.
 
-A primary goal of the project was to integrate multiple independent components into a working end-to-end system rather than implementing each component in isolation.
+| Subsystem | Implementation | Purpose |
+|---|---|---|
+| Live video | RTSP + LibVLC + Android `SurfaceView` | Display a camera stream on Android |
+| Video processing | OpenCV + MediaPipe Pose | Extract human pose landmarks |
+| Event detection | Python landmark and temporal rules | Evaluate movement and posture conditions |
+| Backend | Flask + HTTP / JSON | Expose alerts and processed video |
+| Android integration | OkHttp + `AlertManager` | Poll, store, and display event information |
+| Notifications | BroadcastReceiver + notification channels | Deliver alerts matching user-selected filters |
+| Preferences | `SharedPreferences` | Store notification settings, filters, and contacts |
 
----
+**Video source distinction:** The Android app plays a configured **RTSP stream** directly through LibVLC. The public Flask backend currently uses a **local webcam (`cv2.VideoCapture(0)`)** for its pose-processing pipeline. These are separate video paths and are not automatically synchronized to the same source.
 
 ## System Architecture
 
-```text
-                         Home Camera
-                        /           \
-                       /             \
-                      ▼               ▼
-             RTSP Video Stream    Video Source
-                      │               │
-                      ▼               ▼
-          ┌──────────────────┐   ┌─────────────────────┐
-          │ Android App      │   │ Python Backend      │
-          │                  │   │                     │
-          │ LibVLC           │   │ OpenCV              │
-          │ Live Video       │   │ MediaPipe Pose      │
-          └──────────────────┘   │ Event Detection     │
-                      │          │ Flask REST API      │
-                      │          └──────────┬──────────┘
-                      │                     │
-                      │               /alerts endpoint
-                      │                     │
-                      │                     ▼
-                      │          ┌─────────────────────┐
-                      └─────────►│ Android App         │
-                                 │                     │
-                                 │ OkHttp Polling      │
-                                 │ Alert History       │
-                                 │ Notifications       │
-                                 └─────────────────────┘
+```mermaid
+flowchart LR
+    CAM["Camera / RTSP Source"] -->|RTSP| APP["Android App<br/>LibVLC + SurfaceView"]
+    WEBCAM["Local Webcam<br/>(public backend default)"] --> CV["Python Backend<br/>OpenCV Capture"]
+    CAM -.->|Possible after source configuration| CV
+    CV --> MP["MediaPipe Pose"]
+    MP --> DET["Rule-based Event Detection"]
+    DET --> API["Flask /alerts<br/>JSON"]
+    API -->|OkHttp polling| AM["Android AlertManager"]
+    AM --> HIST["Recent Alert History / UI"]
+    AM --> FILTER["Notification Keyword Filter"]
+    FILTER --> RX["AlertReceiver"]
+    RX --> NOTIF["Android Notifications"]
+    CV --> MJPEG["Flask /video_feed<br/>MJPEG"]
 ```
 
----
+The Android RTSP view and Flask MJPEG output are different paths. Flask does **not** relay the RTSP video into the Android LibVLC player.
 
-## Key Features
+## End-to-End Data Flow
 
-### Real-Time Video Monitoring
+```mermaid
+flowchart TD
+    A["Read video frame"] --> B["Convert BGR to RGB"]
+    B --> C["MediaPipe pose estimation"]
+    C --> D{"Pose landmarks present?"}
+    D -->|No| E["Person-absence event"]
+    D -->|Yes| F["Evaluate enabled pose / timing rules"]
+    E --> G["Update backend in-memory alerts"]
+    F --> G
+    G --> H["GET /alerts returns JSON array"]
+    H --> I["Android OkHttp polling"]
+    I --> J["Read latest array element"]
+    J --> K["Update local alert history"]
+    K --> L{"Notification enabled<br/>and keyword matched?"}
+    L -->|Yes| M["Broadcast to AlertReceiver"]
+    M --> N["Android notification"]
+    L -->|No| O["History / UI only"]
+```
 
-* Displays a live RTSP video stream in the Android application.
-* Uses LibVLC for RTSP playback and video rendering.
-* Manages video playback through the Android `SurfaceView` lifecycle.
-* Integrates the live monitoring interface with event and alert information.
+The current client processes the **last element** in the returned alert array on every poll. It does not use server-side event IDs or a robust deduplication mechanism.
 
-### Pose-Based Event Detection
+## Event Detection
 
-The Python backend uses MediaPipe pose landmarks and rule-based analysis to detect different human activity and posture conditions.
+The Python event rules inspect pose landmarks, joint angles, relative positions, and time thresholds. They are **heuristic rules**, not a trained activity-recognition model.
 
-Implemented detection logic includes:
+The source includes nine detector functions; **only four are called by default** in the current public `backend/app.py` loop.
 
-* Possible fall detection
-* Sudden or vigorous movement
-* Prolonged stillness
-* Abnormal standing posture
-* Sitting posture
-* Possible crawling behavior
-* Repeated wandering movement
-* Person absence detection
-* Prolonged abnormal posture
+| Detection rule | Function | Active in public loop? | Main signal |
+|---|---|---|---|
+| Possible fall | `first()` | No (available) | Shoulder-to-hip displacement |
+| Sudden movement | `second()` | No (available) | Knee-coordinate difference |
+| Prolonged stillness | `third()` | **Yes** | Hip-angle stability over time |
+| Abnormal standing | `fourth()` | **Yes** | Hip-angle threshold and duration |
+| Sitting | `fifth()` | **Yes** | Hip-angle posture condition |
+| Possible crawling | `sixth()` | No (available) | Relative wrist and knee positions |
+| Wandering | `seventh()` | No (available) | Recent nose-position variation |
+| Person absence | `eighth()` | **Yes** | Missing pose landmarks |
+| Prolonged abnormal posture | `ninth()` | No (available) | Combined pose thresholds and duration |
 
-### Flask Backend
+See [`backend/events.py`](backend/events.py) for the rule implementations and [`backend/app.py`](backend/app.py) for the currently enabled calls. Implementation does not imply accuracy or clinical validation.
 
-The Flask backend:
+### Example: Temporal Stillness Detection
 
-* Captures and processes video frames.
-* Runs MediaPipe pose estimation.
-* Executes event-detection functions.
-* Maintains detected alert information.
-* Provides an MJPEG video stream.
-* Exposes alert data as JSON for the Android client.
+```mermaid
+flowchart TD
+    A["Pose landmarks available"] --> B["Compute hip angles"]
+    B --> C{"Stable compared with previous frame?"}
+    C -->|No| D["Reset stable timer"]
+    C -->|Yes| E{"Stable for at least 3 seconds?"}
+    E -->|No| F["Continue monitoring"]
+    E -->|Yes| G["Append stillness alert"]
+```
 
-### Android Alert System
+This illustrates the temporal rule used in `third()`. It does **not** establish medical or health-condition detection.
 
-The Android client periodically communicates with the Flask backend using OkHttp.
+## Android Alert Processing
 
-`AlertManager` is responsible for:
+| Stage | Current behavior |
+|---|---|
+| Polling | `GET /alerts` with OkHttp, scheduled approximately every **1,000 ms** |
+| Event selection | Parse the JSON array and take its latest element |
+| History | Insert timestamped entries; retain up to **10** local records |
+| UI updates | Notify the active listener when the history changes |
+| Filtering | Check notification enable switch and configured keyword matches |
+| Delivery | Broadcast qualifying alerts to `AlertReceiver` |
 
-* Polling the backend `/alerts` endpoint.
-* Retrieving the latest detected event.
-* Maintaining a local history of recent alerts.
-* Updating the active Android UI when alert data changes.
-* Filtering alerts according to user-selected keywords.
-* Broadcasting qualifying events to the Android notification system.
+**Known behavior:** If the latest backend alert remains unchanged, successive polls can append repeated records. Event IDs and deduplication are not implemented.
 
-### Android Notifications
+## Component Design
 
-The application uses Android `BroadcastReceiver` and notification channels to generate system notifications for qualifying monitoring events.
+### Android Client
 
-Users can configure notification-related preferences and event filters through the settings interface.
+| Component | Responsibility |
+|---|---|
+| [`MainActivity`](android/app/app/src/main/java/com/example/myapplication/MainActivity.java) | Live RTSP playback, `SurfaceView` lifecycle, monitoring UI |
+| [`AlertManager`](android/app/app/src/main/java/com/example/myapplication/AlertManager.java) | Asynchronous polling, history, listeners, and notification filtering |
+| [`AlertReceiver`](android/app/app/src/main/java/com/example/myapplication/AlertReceiver.java) | Broadcast handling and Android notifications |
+| [`NotificationActivity`](android/app/app/src/main/java/com/example/myapplication/NotificationActivity.java) | Recent monitoring records |
+| [`Setting`](android/app/app/src/main/java/com/example/myapplication/Setting.java) | Preferences, alert keywords, and saved contacts |
+| [`Phone`](android/app/app/src/main/java/com/example/myapplication/Phone.java) | Contact list and system dialer integration |
 
-### Contact and Dialing Interface
+### Python / Flask Backend
 
-The application also includes a contact interface that:
+| Component | Responsibility |
+|---|---|
+| [`backend/app.py`](backend/app.py) | Frame capture, MediaPipe processing, detector calls, MJPEG encoding, API routes |
+| [`backend/events.py`](backend/events.py) | Landmark helpers, event predicates, timing state, alert generation |
+| [`backend/requirements.txt`](backend/requirements.txt) | Python dependencies |
 
-* Stores user-configured contacts with `SharedPreferences`.
-* Displays saved contacts within the application.
-* Opens the Android system dialer when a contact is selected.
+The backend stores alerts in a Python list **in memory**; it is not a persistent event database.
 
----
+## API and Technology Choices
 
-## Project Structure
+### Flask Endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /` | Backend status text |
+| `GET /video_feed` | Processed MJPEG video stream |
+| `GET /alerts` | JSON array containing alert strings |
+| `GET /video` | Browser-based MJPEG and alert display |
+
+### Engineering Rationale
+
+| Choice | Benefit | Trade-off |
+|---|---|---|
+| Direct RTSP playback with LibVLC | Dedicated mobile live-view path | Sensitive to network and player lifecycle |
+| MediaPipe landmarks + rules | Explainable event conditions | Thresholds depend on scene and viewpoint |
+| Flask + JSON | Simple backend/client interface | Development setup is not production-hardened |
+| OkHttp polling | Straightforward periodic integration | Repeats, network overhead, and delivery latency |
+| SharedPreferences | Lightweight on-device settings | Not a shared or synchronized settings database |
+
+## Build and Configuration
+
+### Backend
+
+From the repository root:
+
+```bash
+python -m pip install -r backend/requirements.txt
+python backend/app.py
+```
+
+The public backend defaults to **local webcam index 0**. The development server uses port **5000**; for example, `http://127.0.0.1:5000/video` displays the browser page when the backend is running.
+
+To capture from an RTSP source instead, update the video-capture configuration in `backend/app.py` and provide your own camera address.
+
+### Android
+
+The public Android source includes placeholder addresses that need to be configured for the local environment:
 
 ```text
-Real-Time-Home-Monitoring-System/
-│
+RTSP_URL  = rtsp://username:password@camera-ip:554/stream1
+FLASK_URL = http://server-ip:5000/alerts
+```
+
+**Build limitation:** This public repository contains selected Android Java files and Gradle configuration but does **not** include the full Android manifest and resource files required for a confirmed standalone application build. Treat it as a source-code portfolio, not a verified one-command deployment package.
+
+**Security note:** Never commit actual camera credentials. The current Flask development configuration uses `debug=True` and binds to `0.0.0.0`; do not expose this server directly to the public internet. The sample HTTP-based alert API does not provide production-grade authentication or encrypted transport.
+
+## Engineering Trade-offs and Limitations
+
+| Area | Current status / limitation |
+|---|---|
+| Detection coverage | Four of nine detector functions enabled in the public loop |
+| Detection accuracy | No reproducible evaluation dataset or per-class accuracy report in this repository |
+| Event reliability | No event IDs or deduplication in Android polling |
+| Persistence | Backend alert list resets on restart |
+| Streaming | Android RTSP and Flask capture are separately configured |
+| Deployment | Local development configuration; Android source set is incomplete |
+| Testing | No verified clean build or automated end-to-end test report included |
+
+### Future Work
+
+- Introduce event IDs, acknowledgement, deduplication, and bounded backend history.
+- Replace polling with WebSocket or Server-Sent Events where appropriate.
+- Make source addresses configurable without editing code.
+- Add secure authentication and transport for remote deployment.
+- Evaluate event precision, false positives, detection latency, and recovery with recorded test cases.
+- Package the missing Android resources and verify a clean build.
+
+## Repository Structure
+
+```text
+Real-Time-Human-Activity-Monitoring/
 ├── backend/
 │   ├── app.py
 │   ├── events.py
 │   └── requirements.txt
-│
 ├── android/
-│   ├── app/
-│   │   └── app/
-│   │       └── src/
-│   │           └── main/
-│   │               └── java/
-│   │                   └── com/
-│   │                       └── example/
-│   │                           └── myapplication/
-│   │                               ├── MainActivity.java
-│   │                               ├── AlertManager.java
-│   │                               ├── AlertReceiver.java
-│   │                               ├── NotificationActivity.java
-│   │                               ├── NotificationHelper.java
-│   │                               ├── Phone.java
-│   │                               └── Setting.java
-│   │
+│   ├── app/app/src/main/java/com/example/myapplication/
+│   │   ├── MainActivity.java
+│   │   ├── AlertManager.java
+│   │   ├── AlertReceiver.java
+│   │   ├── NotificationActivity.java
+│   │   ├── NotificationHelper.java
+│   │   ├── Phone.java
+│   │   └── Setting.java
 │   ├── gradle/
 │   ├── build.gradle.kts
-│   ├── gradle.properties
-│   ├── gradlew
-│   ├── gradlew.bat
 │   └── settings.gradle.kts
-│
 ├── .gitignore
 └── README.md
 ```
 
----
+## Contributions
 
-## Android Application
+This was a **team-based capstone project**. My primary contributions were **Android development and end-to-end system integration**, including RTSP video playback, client/backend communication, event retrieval, alert history, notification filters, and Android notification handling.
 
-### `MainActivity`
+The pose-based detection code is documented as part of the team's overall system and is **not presented as solely my individual work**.
 
-The main monitoring interface.
+## Project Team & Contributions
 
-Responsibilities include:
+**Project Type:** Undergraduate Team Capstone Project  
+**Institution:** National Taipei University of Education  
+**Contributor:** Hoi Chun (Chris) Wat
 
-* Initializing LibVLC.
-* Connecting to the RTSP video stream.
-* Rendering live video through `SurfaceView`.
-* Managing the VLC player lifecycle.
-* Navigating between monitoring, notification, contact, and settings screens.
-* Starting background alert polling through `AlertManager`.
-* Displaying recent alert information.
+**My Primary Contributions:**
+- Developed and integrated Android application components for real-time home monitoring.
+- Integrated RTSP video playback using LibVLC and managed the Android video surface lifecycle.
+- Implemented backend-to-Android communication using OkHttp and JSON-based HTTP requests.
+- Developed alert history management, configurable notification filtering, and Android system notification workflows.
+- Contributed to end-to-end integration of video streaming, event detection, backend communication, and the mobile interface.
 
-### `AlertManager`
-
-A singleton manager responsible for background communication with the Flask backend.
-
-It:
-
-* Polls the `/alerts` endpoint at regular intervals.
-* Processes the most recent backend event.
-* Maintains a limited alert history.
-* Updates registered UI listeners.
-* Checks notification keyword preferences.
-* Broadcasts qualifying alerts to `AlertReceiver`.
-
-### `AlertReceiver`
-
-Receives alert broadcasts from `AlertManager` and generates Android system notifications using a high-priority notification channel.
-
-### `NotificationActivity`
-
-Displays recent monitoring and detection records received through `AlertManager`.
-
-### `NotificationHelper`
-
-Provides helper functionality for creating Android notification channels and displaying notifications.
-
-### `Setting`
-
-Manages application preferences using Android `SharedPreferences`, including:
-
-* Notification enable/disable
-* Event keyword filters
-* Custom alert keywords
-* Contact names and phone numbers
-
-### `Phone`
-
-Loads saved contacts and provides an interface for opening the Android system dialer.
-
----
-
-## Backend
-
-The backend is implemented using Python, Flask, OpenCV, MediaPipe, and NumPy.
-
-### `app.py`
-
-The main backend application.
-
-Responsibilities include:
-
-* Opening a video source.
-* Processing video frames with MediaPipe.
-* Drawing detected pose landmarks.
-* Calling event-detection functions.
-* Displaying detection states on processed frames.
-* Encoding frames for MJPEG streaming.
-* Serving Flask endpoints for video and alert data.
-
-### `events.py`
-
-Contains the rule-based event-detection logic.
-
-It processes MediaPipe pose landmarks and evaluates posture, movement, and timing conditions to determine whether monitored events have occurred.
-
-Shared helper functions are used for:
-
-* Pose landmark extraction
-* Joint-angle calculation
-* Pose stability analysis
-* Alert generation
-
----
-
-## Flask Endpoints
-
-| Endpoint      | Description                                          |
-| ------------- | ---------------------------------------------------- |
-| `/`           | Returns backend status information                   |
-| `/video_feed` | Provides the processed MJPEG video stream            |
-| `/alerts`     | Returns detected alerts as JSON                      |
-| `/video`      | Provides a simple browser-based monitoring interface |
-
----
-
-## Technologies
-
-| Area               | Technologies                           |
-| ------------------ | -------------------------------------- |
-| Mobile Application | Android, Java                          |
-| Backend            | Python, Flask                          |
-| Computer Vision    | MediaPipe, OpenCV, NumPy               |
-| Video Streaming    | RTSP, LibVLC, MJPEG                    |
-| Networking         | REST/HTTP, JSON, OkHttp                |
-| Local Storage      | Android SharedPreferences              |
-| Notifications      | BroadcastReceiver, NotificationManager |
-| Development        | Android Studio, Git, GitHub            |
-
----
-
-## Backend Setup
-
-### 1. Install Dependencies
-
-```bash
-pip install -r backend/requirements.txt
-```
-
-### 2. Run the Backend
-
-```bash
-python backend/app.py
-```
-
-The public version is configured to use a local webcam by default.
-
-Camera addresses, RTSP credentials, and environment-specific server addresses are intentionally excluded from this public repository.
-
----
-
-## Android Configuration
-
-Before running the Android application, configure the appropriate local endpoints for your environment.
-
-Example placeholders used in the public version:
-
-```text
-RTSP_URL = rtsp://username:password@camera-ip:554/stream1
-FLASK_URL = http://server-ip:5000/alerts
-```
-
-Real credentials and private network configuration should not be committed to a public repository.
-
----
-
-## Engineering Experience
-
-The project involved integration across multiple technical areas, including:
-
-- Real-time video streaming
-- Android application development
-- Python backend development
-- REST-based client-server communication
-- MediaPipe pose estimation
-- Rule-based event detection
-- Background network polling
-- Android lifecycle management
-- Android notification handling
-- SharedPreferences-based configuration
-- End-to-end system integration
-
-The system architecture connects video streaming, computer vision, backend processing, network communication, alert management, and a mobile interface into an end-to-end monitoring pipeline.
-
-## Future Improvements
-
-Potential improvements include:
-
-* Replacing periodic HTTP polling with WebSocket or Server-Sent Events
-* Improving event classification and false-positive suppression
-* Moving environment-specific endpoints into external configuration
-* Adding secure authentication between the mobile client and backend
-* Adding persistent alert and event storage
-* Improving event-history visualization
-* Adding automated testing
-* Adding CI workflows
-* Improving deployment support for persistent backend hosting
-
----
-
-## Project Context & Contributions
-
-This project was developed as a team-based capstone project.
-
-My primary contributions focused on system integration and Android application development, including:
-
-- Integrated the Android application with the real-time monitoring backend.
-- Implemented RTSP video streaming and playback using LibVLC.
-- Developed backend-to-Android alert communication and event retrieval.
-- Implemented alert history, notification filtering, and Android notification workflows.
-- Contributed to integrating video streaming, backend processing, event detection, and the mobile interface into an end-to-end monitoring system.
-
-The repository contains selected components of the project that demonstrate the system architecture and implementation.
+*This project was developed collaboratively. The repository documents the overall system architecture and selected implementation components; the contributions above describe my primary responsibilities.*
