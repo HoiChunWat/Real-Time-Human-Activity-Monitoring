@@ -321,9 +321,3 @@ The pose-based detection code is documented as part of the team's overall system
 - Contributed to end-to-end integration of video streaming, event detection, backend communication, and the mobile interface.
 
 *This project was developed collaboratively. The repository documents the overall system architecture and selected implementation components; the contributions above describe my primary responsibilities.*
-
-## Post-Capstone Engineering Improvements — November 2026
-
-The original undergraduate team capstone prototype was revisited in November 2026 to improve event synchronization, resource management, and communication reliability. The post-capstone update introduces bounded event storage, sequence-based incremental processing, duplicate prevention, request concurrency control, and sequence-gap detection.
-
-These changes were developed after the original capstone with AI-assisted implementation. They are distinct from the original team project and the original individual contributions listed above. Backend buffer unit tests are included; the updated Android implementation has not undergone a verified clean build, device test, or end-to-end validation. No measured performance improvement or zero-loss delivery guarantee is claimed.
