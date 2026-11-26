@@ -21,7 +21,6 @@ An end-to-end monitoring prototype that connects **live video streaming**, **pos
 - [Engineering Trade-offs and Limitations](#engineering-trade-offs-and-limitations)
 - [Repository Structure](#repository-structure)
 - [Contributions](#contributions)
-- [Post-Capstone Engineering Improvements — November 2026](#post-capstone-engineering-improvements--november-2026)
 
 ## Project Overview
 
