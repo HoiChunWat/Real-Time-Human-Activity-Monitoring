@@ -8,12 +8,14 @@ import android.os.Looper;
 import android.util.Log;
 
 import org.json.JSONArray;
+import org.json.JSONObject;
 
 import java.io.IOException;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.LinkedList;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import okhttp3.Call;
 import okhttp3.Callback;
@@ -25,7 +27,7 @@ import okhttp3.Response;
  * Singleton manager responsible for background alert polling.
  *
  * <p>The manager periodically requests the Flask /alerts endpoint, stores the
- * latest alert in a short history list, updates the active UI listener, and
+ * unseen alerts in a short history list, updates the active UI listener, and
  * broadcasts qualifying events to AlertReceiver for Android notifications.</p>
  */
 public class AlertManager {
@@ -41,7 +43,12 @@ public class AlertManager {
     private static final int INTERVAL_MS = 1000;
 
     // Replace with the Flask endpoint used in your local environment.
-    private static final String FLASK_URL = "http://server-ip:5000/alerts";
+    private static final String FLASK_URL = "http://server-ip:5000/alerts/sync";
+
+    // One request at a time; cursor and history updates run on the main thread.
+    private final AtomicBoolean requestInFlight = new AtomicBoolean(false);
+    private String streamId;
+    private long lastProcessedId = 0;
 
     private boolean isRunning = false;
     private Runnable fetchTask;
@@ -94,80 +101,123 @@ public class AlertManager {
         this.listener = listener;
 
         if (listener != null) {
-            listener.onAlertUpdate(new LinkedList<>(alertHistory));
+            listener.onAlertUpdate(historySnapshot());
         }
     }
 
-    /** Request the latest alert list from the Flask backend. */
+    /** Fetch one bounded snapshot without overlapping network requests. */
     private void fetchFromFlask() {
-        Request request = new Request.Builder().url(FLASK_URL).build();
+        if (!requestInFlight.compareAndSet(false, true)) {
+            return;
+        }
 
-        client.newCall(request).enqueue(new Callback() {
-            @Override
-            public void onFailure(Call call, IOException e) {
-                Log.e(TAG, "Flask connection failed: " + e.getMessage());
-            }
-
-            @Override
-            public void onResponse(Call call, Response response) throws IOException {
-                if (!response.isSuccessful()) {
-                    Log.e(TAG, "Server response error: " + response.message());
-                    return;
+        try {
+            Request request = new Request.Builder().url(FLASK_URL).build();
+            client.newCall(request).enqueue(new Callback() {
+                @Override
+                public void onFailure(Call call, IOException e) {
+                    requestInFlight.set(false);
+                    Log.e(TAG, "Flask connection failed: " + e.getMessage());
                 }
 
-                String body = response.body() != null ? response.body().string() : "";
+                @Override
+                public void onResponse(Call call, Response response) {
+                    boolean posted = false;
+                    try (Response closeableResponse = response) {
+                        if (!response.isSuccessful() || response.body() == null) {
+                            Log.e(TAG, "Server response error: " + response.code());
+                            return;
+                        }
 
-                try {
-                    JSONArray events = new JSONArray(body);
-
-                    if (events.length() == 0) {
-                        return;
-                    }
-
-                    // Only process the most recent event returned by the backend.
-                    String latest = events.optString(events.length() - 1, "");
-
-                    if (latest.isEmpty()
-                            || "null".equals(latest)
-                            || "None".equals(latest)) {
-                        return;
-                    }
-
-                    String timestamp = new SimpleDateFormat(
-                            "HH:mm:ss",
-                            Locale.getDefault()
-                    ).format(new Date());
-
-                    String record = "[" + timestamp + "] " + latest;
-
-                    // Store the latest event at the front of the history list.
-                    synchronized (alertHistory) {
-                        alertHistory.addFirst(record);
-
-                        if (alertHistory.size() > MAX_SIZE) {
-                            alertHistory.removeLast();
+                        JSONObject snapshot = new JSONObject(response.body().string());
+                        posted = handler.post(() -> {
+                            try {
+                                if (isRunning) {
+                                    processSnapshot(snapshot);
+                                }
+                            } catch (Exception e) {
+                                Log.e(TAG, "Event synchronization failed", e);
+                            } finally {
+                                requestInFlight.set(false);
+                            }
+                        });
+                    } catch (Exception e) {
+                        Log.e(TAG, "Alert response parsing failed", e);
+                    } finally {
+                        if (!posted) {
+                            requestInFlight.set(false);
                         }
                     }
+                }
+            });
+        } catch (RuntimeException e) {
+            requestInFlight.set(false);
+            Log.e(TAG, "Unable to schedule alert request", e);
+        }
+    }
 
-                    // Update the active UI.
-                    if (listener != null) {
-                        listener.onAlertUpdate(new LinkedList<>(alertHistory));
-                    }
+    /** Apply new events in ascending ID order, once per running client. */
+    private void processSnapshot(JSONObject snapshot) throws Exception {
+        String incomingStream = snapshot.getString("stream_id");
+        JSONArray events = snapshot.getJSONArray("events");
 
-                    // Broadcast events that match the user's notification filters.
-                    if (appContext != null && shouldNotify(latest)) {
-                        Intent alertIntent = new Intent(appContext, AlertReceiver.class);
-                        alertIntent.putExtra("alert_message", record);
-                        appContext.sendBroadcast(alertIntent);
+        if (!incomingStream.equals(streamId)) {
+            if (streamId != null) {
+                Log.w(TAG, "Backend restarted; earlier in-memory events may be unavailable.");
+            }
+            streamId = incomingStream;
+            lastProcessedId = 0;
+        }
 
-                        Log.d(TAG, "Broadcast sent to AlertReceiver: " + record);
-                    }
+        boolean changed = false;
+        for (int i = 0; i < events.length(); i++) {
+            JSONObject event = events.getJSONObject(i);
+            long id = event.getLong("id");
+            if (id <= lastProcessedId) {
+                continue;
+            }
 
-                } catch (Exception e) {
-                    Log.e(TAG, "JSON parsing failed: " + e.getMessage());
+            String message = event.getString("message");
+            if (id > lastProcessedId + 1) {
+                Log.w(TAG, "Event gap: expected " + (lastProcessedId + 1)
+                        + ", received " + id + ". Older events may have expired.");
+            }
+
+            String timestamp = new SimpleDateFormat(
+                    "HH:mm:ss", Locale.getDefault()).format(new Date());
+            String record = "[" + timestamp + "] " + message;
+
+            synchronized (alertHistory) {
+                alertHistory.addFirst(record);
+                if (alertHistory.size() > MAX_SIZE) {
+                    alertHistory.removeLast();
                 }
             }
-        });
+            lastProcessedId = id;
+            changed = true;
+
+            // Each new event is evaluated, even if it falls outside the 10-record UI.
+            try {
+                if (appContext != null && shouldNotify(message)) {
+                    Intent alertIntent = new Intent(appContext, AlertReceiver.class);
+                    alertIntent.putExtra("alert_message", record);
+                    appContext.sendBroadcast(alertIntent);
+                }
+            } catch (RuntimeException e) {
+                Log.e(TAG, "Notification broadcast failed for event " + id, e);
+            }
+        }
+
+        // Refresh the UI once per batch, not once per historical event.
+        if (changed && listener != null) {
+            listener.onAlertUpdate(historySnapshot());
+        }
+    }
+
+    private LinkedList<String> historySnapshot() {
+        synchronized (alertHistory) {
+            return new LinkedList<>(alertHistory);
+        }
     }
 
     /**
@@ -267,7 +317,7 @@ public class AlertManager {
         }
 
         if (listener != null) {
-            listener.onAlertUpdate(new LinkedList<>(alertHistory));
+            listener.onAlertUpdate(historySnapshot());
         }
     }
 }

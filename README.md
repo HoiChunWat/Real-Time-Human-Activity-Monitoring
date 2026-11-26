@@ -45,7 +45,7 @@ flowchart LR
     CAM -.->|Possible after source configuration| CV
     CV --> MP["MediaPipe Pose"]
     MP --> DET["Rule-based Event Detection"]
-    DET --> API["Flask /alerts<br/>JSON"]
+    DET --> API["Flask /alerts/sync<br/>JSON event IDs"]
     API -->|OkHttp polling| AM["Android AlertManager"]
     AM --> HIST["Recent Alert History / UI"]
     AM --> FILTER["Notification Keyword Filter"]
@@ -67,9 +67,9 @@ flowchart TD
     D -->|Yes| F["Evaluate enabled pose / timing rules"]
     E --> G["Update backend in-memory alerts"]
     F --> G
-    G --> H["GET /alerts returns JSON array"]
+    G --> H["GET /alerts/sync returns bounded event snapshot"]
     H --> I["Android OkHttp polling"]
-    I --> J["Read latest array element"]
+    I --> J["Process all unseen event IDs"]
     J --> K["Update local alert history"]
     K --> L{"Notification enabled<br/>and keyword matched?"}
     L -->|Yes| M["Broadcast to AlertReceiver"]
@@ -77,7 +77,7 @@ flowchart TD
     L -->|No| O["History / UI only"]
 ```
 
-The current client processes the **last element** in the returned alert array on every poll. It does not use server-side event IDs or a robust deduplication mechanism.
+The Android client processes all unseen event IDs from a bounded snapshot of the latest 100 events. A server stream ID distinguishes backend restarts; a sequence gap is logged when older events have expired.
 
 ## Event Detection
 
@@ -117,14 +117,14 @@ This illustrates the temporal rule used in `third()`. It does **not** establish 
 
 | Stage | Current behavior |
 |---|---|
-| Polling | `GET /alerts` with OkHttp, scheduled approximately every **1,000 ms** |
-| Event selection | Parse the JSON array and take its latest element |
+| Polling | `GET /alerts/sync` with OkHttp, scheduled approximately every **1,000 ms**; at most one request in flight |
+| Event selection | Process all IDs newer than the last processed ID, in ascending order |
 | History | Insert timestamped entries; retain up to **10** local records |
 | UI updates | Notify the active listener when the history changes |
 | Filtering | Check notification enable switch and configured keyword matches |
 | Delivery | Broadcast qualifying alerts to `AlertReceiver` |
 
-**Known behavior:** If the latest backend alert remains unchanged, successive polls can append repeated records. Event IDs and deduplication are not implemented.
+**Synchronization:** The backend retains at most 100 events. Each event receives a monotonically increasing ID within the current server process. The client skips previously processed IDs, updates the UI once per batch, and evaluates each new event for notifications. The cursor is in memory: restarting the app may replay retained events, and an outage longer than the retention window can lose old events. A sequence gap is logged, not recovered.
 
 ## Component Design
 
@@ -147,7 +147,7 @@ This illustrates the temporal rule used in `third()`. It does **not** establish 
 | [`backend/events.py`](backend/events.py) | Landmark helpers, event predicates, timing state, alert generation |
 | [`backend/requirements.txt`](backend/requirements.txt) | Python dependencies |
 
-The backend stores alerts in a Python list **in memory**; it is not a persistent event database.
+The backend stores alerts in a thread-safe, bounded in-memory deque (latest 100 events); it is not a persistent event database.
 
 ## API and Technology Choices
 
@@ -157,8 +157,19 @@ The backend stores alerts in a Python list **in memory**; it is not a persistent
 |---|---|
 | `GET /` | Backend status text |
 | `GET /video_feed` | Processed MJPEG video stream |
-| `GET /alerts` | JSON array containing alert strings |
+| `GET /alerts` | JSON array of up to 100 alert strings (browser-compatible) |
+| `GET /alerts/sync` | JSON object with `stream_id` and up to 100 ordered `{id, message}` events |
 | `GET /video` | Browser-based MJPEG and alert display |
+
+### Event synchronization verification
+
+Run the backend buffer tests from the repository root:
+
+```bash
+python -m unittest discover -s backend -p 'test_*.py'
+```
+
+Manual Android checks: poll once, append three distinct events between polls, confirm all three are processed, then poll again without changes and verify no duplicate. Send two identical messages in one second and verify both IDs are processed. Append more than 100 events between successful polls and confirm a gap is logged and only retained events are processed. Restart the backend and verify the new stream ID resets the cursor. Android build/device verification requires the complete local Android project.
 
 ### Engineering Rationale
 
@@ -167,7 +178,7 @@ The backend stores alerts in a Python list **in memory**; it is not a persistent
 | Direct RTSP playback with LibVLC | Dedicated mobile live-view path | Sensitive to network and player lifecycle |
 | MediaPipe landmarks + rules | Explainable event conditions | Thresholds depend on scene and viewpoint |
 | Flask + JSON | Simple backend/client interface | Development setup is not production-hardened |
-| OkHttp polling | Straightforward periodic integration | Repeats, network overhead, and delivery latency |
+| OkHttp polling | Straightforward periodic integration with client-side ID deduplication | Repeated bounded snapshots and polling latency |
 | SharedPreferences | Lightweight on-device settings | Not a shared or synchronized settings database |
 
 ## Build and Configuration
@@ -191,7 +202,7 @@ The public Android source includes placeholder addresses that need to be configu
 
 ```text
 RTSP_URL  = rtsp://username:password@camera-ip:554/stream1
-FLASK_URL = http://server-ip:5000/alerts
+FLASK_URL = http://server-ip:5000/alerts/sync
 ```
 
 **Build limitation:** This public repository contains selected Android Java files and Gradle configuration but does **not** include the full Android manifest and resource files required for a confirmed standalone application build. Treat it as a source-code portfolio, not a verified one-command deployment package.
@@ -204,15 +215,15 @@ FLASK_URL = http://server-ip:5000/alerts
 |---|---|
 | Detection coverage | Four of nine detector functions enabled in the public loop |
 | Detection accuracy | No reproducible evaluation dataset or per-class accuracy report in this repository |
-| Event reliability | No event IDs or deduplication in Android polling |
-| Persistence | Backend alert list resets on restart |
+| Event reliability | ID-based deduplication within a running client; expired events cannot be recovered |
+| Persistence | Backend buffer and Android cursor are in memory; restarts can lose or replay events |
 | Streaming | Android RTSP and Flask capture are separately configured |
 | Deployment | Local development configuration; Android source set is incomplete |
 | Testing | No verified clean build or automated end-to-end test report included |
 
 ### Future Work
 
-- Introduce event IDs, acknowledgement, deduplication, and bounded backend history.
+- Add persistent event storage and durable client cursors/acknowledgements; support server-side incremental responses instead of repeated bounded snapshots.
 - Replace polling with WebSocket or Server-Sent Events where appropriate.
 - Make source addresses configurable without editing code.
 - Add secure authentication and transport for remote deployment.
@@ -226,6 +237,8 @@ Real-Time-Human-Activity-Monitoring/
 ├── backend/
 │   ├── app.py
 │   ├── events.py
+│   ├── event_buffer.py
+│   ├── test_event_buffer.py
 │   └── requirements.txt
 ├── android/
 │   ├── app/app/src/main/java/com/example/myapplication/
