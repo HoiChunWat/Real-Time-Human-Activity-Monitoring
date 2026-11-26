@@ -38,10 +38,6 @@ mp_drawing = mp.solutions.drawing_utils
 rtsp_url = "rtsp://username:password@camera-ip:554/stream1"
 
 
-# Clear old alerts when the server starts.
-alerts.clear()
-
-
 # ---------------------------------------------------------------------------
 # Video processing
 # ---------------------------------------------------------------------------
@@ -246,7 +242,13 @@ def video_feed():
 
 @app.route("/alerts")
 def get_alerts():
-    return jsonify(alerts)
+    return jsonify(alerts.messages())
+
+
+@app.route("/alerts/sync")
+def sync_alerts():
+    """Return the bounded event window with IDs for Android synchronization."""
+    return jsonify(alerts.snapshot())
 
 
 @app.route("/video")

@@ -4,6 +4,8 @@ import time
 import mediapipe as mp
 import numpy as np
 
+from event_buffer import EventBuffer
+
 
 # MediaPipe pose namespace
 mppose = mp.solutions.pose
@@ -17,7 +19,7 @@ start_time5 = 0
 last_stable_time = 0
 previous_angles = None
 
-alerts = []
+alerts = EventBuffer(capacity=100)
 
 
 # ---------------------------------------------------------------------------
@@ -28,10 +30,6 @@ def add_alert(message):
     """Append a timestamped alert message to the shared alert list."""
     timestamp = time.strftime("%H:%M:%S", time.localtime())
     alerts.append(f"{timestamp} - {message}")
-
-    # Optional: keep only the most recent 20 alerts.
-    # if len(alerts) > 20:
-    #     alerts.pop(0)
 
 
 def get_landmarks(context):

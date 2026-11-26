@@ -9,6 +9,8 @@ import android.content.Intent;
 import android.os.Build;
 import android.util.Log;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
 
@@ -16,6 +18,8 @@ public class AlertReceiver extends BroadcastReceiver {
 
     private static final String TAG = "AlertReceiver";
     private static final String CHANNEL_ID = "alert_channel";
+    private static final AtomicInteger NEXT_NOTIFICATION_ID =
+            new AtomicInteger((int) (System.currentTimeMillis() & 0xFFFFFFF));
 
     @Override
     public void onReceive(Context context, Intent intent) {
@@ -54,11 +58,11 @@ public class AlertReceiver extends BroadcastReceiver {
                         .setAutoCancel(true)
                         .setContentIntent(pendingIntent);
 
-        // Use a time-based ID so multiple alerts can appear separately.
+        // Allocate distinct IDs even when a batch arrives within one millisecond.
         NotificationManagerCompat manager =
                 NotificationManagerCompat.from(context);
 
-        int id = (int) (System.currentTimeMillis() & 0xFFFFFFF);
+        int id = NEXT_NOTIFICATION_ID.getAndIncrement();
         manager.notify(id, builder.build());
     }
 
