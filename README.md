@@ -13,12 +13,15 @@ An end-to-end monitoring prototype that connects **live video streaming**, **pos
 - [End-to-End Data Flow](#end-to-end-data-flow)
 - [Event Detection](#event-detection)
 - [Android Alert Processing](#android-alert-processing)
+- [Performance & Reliability Design](#performance--reliability-design)
+- [Complexity Analysis](#complexity-analysis)
 - [Component Design](#component-design)
 - [API and Technology Choices](#api-and-technology-choices)
 - [Build and Configuration](#build-and-configuration)
 - [Engineering Trade-offs and Limitations](#engineering-trade-offs-and-limitations)
 - [Repository Structure](#repository-structure)
 - [Contributions](#contributions)
+- [Post-Capstone Engineering Improvements — November 2026](#post-capstone-engineering-improvements--november-2026)
 
 ## Project Overview
 
@@ -45,7 +48,8 @@ flowchart LR
     CAM -.->|Possible after source configuration| CV
     CV --> MP["MediaPipe Pose"]
     MP --> DET["Rule-based Event Detection"]
-    DET --> API["Flask /alerts/sync<br/>JSON event IDs"]
+    DET --> BUF["Bounded Event Buffer<br/>Latest 100 events"]
+    BUF --> API["Flask /alerts/sync<br/>JSON event IDs"]
     API -->|OkHttp polling| AM["Android AlertManager"]
     AM --> HIST["Recent Alert History / UI"]
     AM --> FILTER["Notification Keyword Filter"]
@@ -65,7 +69,7 @@ flowchart TD
     C --> D{"Pose landmarks present?"}
     D -->|No| E["Person-absence event"]
     D -->|Yes| F["Evaluate enabled pose / timing rules"]
-    E --> G["Update backend in-memory alerts"]
+    E --> G["Append event to bounded buffer<br/>Assign sequence ID"]
     F --> G
     G --> H["GET /alerts/sync returns bounded event snapshot"]
     H --> I["Android OkHttp polling"]
@@ -120,11 +124,50 @@ This illustrates the temporal rule used in `third()`. It does **not** establish 
 | Polling | `GET /alerts/sync` with OkHttp, scheduled approximately every **1,000 ms**; at most one request in flight |
 | Event selection | Process all IDs newer than the last processed ID, in ascending order |
 | History | Insert timestamped entries; retain up to **10** local records |
-| UI updates | Notify the active listener when the history changes |
+| UI updates | Notify the active listener once per batch of newly processed events |
 | Filtering | Check notification enable switch and configured keyword matches |
 | Delivery | Broadcast qualifying alerts to `AlertReceiver` |
 
-**Synchronization:** The backend retains at most 100 events. Each event receives a monotonically increasing ID within the current server process. The client skips previously processed IDs, updates the UI once per batch, and evaluates each new event for notifications. The cursor is in memory: restarting the app may replay retained events, and an outage longer than the retention window can lose old events. A sequence gap is logged, not recovered.
+**Synchronization:** The backend retains at most 100 events. Each event receives a monotonically increasing ID within the current server process. The client skips previously processed IDs, updates the UI once per batch, and evaluates each new event for notifications. The cursor is in memory: restarting the app may replay retained events, and more than 100 new events between successful synchronizations can cause old events to expire. A sequence gap is logged, not recovered.
+
+## Performance & Reliability Design
+
+The event synchronization path was redesigned to bound resource usage while processing multiple new events between polling intervals.
+
+| Design | Implementation | Engineering benefit |
+|---|---|---|
+| Bounded buffer | Thread-safe `deque(maxlen=100)` | Bounds the number of retained events |
+| Bounded transmission | At most 100 events per response | Bounds payload and parsing work for bounded-size records |
+| Incremental processing | Ordered event sequence IDs and a client cursor | Processes all retained unseen events instead of only the newest one |
+| Deduplication | Skip IDs at or below `lastProcessedId` | Avoids reprocessing received IDs within a client session |
+| Thread synchronization | Backend lock protects ID allocation and snapshots | Keeps event records and sequence IDs consistent across concurrent access |
+| Request concurrency control | Atomic in-flight request flag | Prevents overlapping polls and out-of-order responses |
+| Batch UI updates | One listener update per nonempty batch | Avoids refreshing the UI for every event |
+| Sequence gap detection | Compare the incoming ID with the expected next ID | Logs potential event loss when older records have expired |
+| Restart detection | Per-process stream identifier | Distinguishes backend sessions and resets the cursor |
+
+### Example: Multiple events between polls
+
+If the Android client last processed event 97 and the next response contains events through 100, it skips previously processed IDs, handles events 98, 99, and 100 in order, and advances its cursor to 100. A subsequent unchanged response produces no new history entries. Each new event is evaluated separately against notification filters, while the UI retains only its latest 10 records.
+
+The server still sends a bounded snapshot, not a delta response. Synchronization is incremental on the client side. This design improves application-level delivery reliability but does not guarantee durable or exactly-once delivery across restarts, long outages, or notification failures.
+
+## Complexity Analysis
+
+Let N be the cumulative number of generated events, B the configured backend capacity (100), S = min(N, B) the number of retained events, and K the number of unseen events in the received snapshot (0 ≤ K ≤ S). Assume bounded-size event records and fixed-size notification settings.
+
+| Operation | Original prototype | Updated implementation |
+|---|---|---|
+| Backend event storage | O(N) | O(B) maximum |
+| Append event | Amortized O(1) | O(1) |
+| JSON serialization | O(N) | O(S) |
+| HTTP response payload | O(N) | O(S) |
+| Client JSON parsing | O(N) | O(S) |
+| Event selection after parsing | O(1), latest only | O(S), scan ordered IDs |
+| New event handling | At most one per poll | O(K) |
+| Local history storage | At most 10 records | At most 10 records |
+
+With a fixed buffer capacity, the number of events serialized, transmitted, and scanned per successful poll is bounded independently of total runtime. Under a constant event generation rate and fixed polling frequency, cumulative event transmission changes from quadratic growth before the redesign to at most linear growth after the buffer fills. These are analytical bounds, not measured throughput, latency, or memory benchmarks.
 
 ## Component Design
 
@@ -145,6 +188,8 @@ This illustrates the temporal rule used in `third()`. It does **not** establish 
 |---|---|
 | [`backend/app.py`](backend/app.py) | Frame capture, MediaPipe processing, detector calls, MJPEG encoding, API routes |
 | [`backend/events.py`](backend/events.py) | Landmark helpers, event predicates, timing state, alert generation |
+| [`backend/event_buffer.py`](backend/event_buffer.py) | Thread-safe bounded storage, event sequence IDs, stream IDs and snapshots |
+| [`backend/test_event_buffer.py`](backend/test_event_buffer.py) | Unit tests for capacity, ID uniqueness, concurrency and restart isolation |
 | [`backend/requirements.txt`](backend/requirements.txt) | Python dependencies |
 
 The backend stores alerts in a thread-safe, bounded in-memory deque (latest 100 events); it is not a persistent event database.
@@ -219,7 +264,7 @@ FLASK_URL = http://server-ip:5000/alerts/sync
 | Persistence | Backend buffer and Android cursor are in memory; restarts can lose or replay events |
 | Streaming | Android RTSP and Flask capture are separately configured |
 | Deployment | Local development configuration; Android source set is incomplete |
-| Testing | No verified clean build or automated end-to-end test report included |
+| Testing | Backend buffer unit tests included; full Android build, device and end-to-end validation remain unverified |
 
 ### Future Work
 
@@ -276,3 +321,9 @@ The pose-based detection code is documented as part of the team's overall system
 - Contributed to end-to-end integration of video streaming, event detection, backend communication, and the mobile interface.
 
 *This project was developed collaboratively. The repository documents the overall system architecture and selected implementation components; the contributions above describe my primary responsibilities.*
+
+## Post-Capstone Engineering Improvements — November 2026
+
+The original undergraduate team capstone prototype was revisited in November 2026 to improve event synchronization, resource management, and communication reliability. The post-capstone update introduces bounded event storage, sequence-based incremental processing, duplicate prevention, request concurrency control, and sequence-gap detection.
+
+These changes were developed after the original capstone with AI-assisted implementation. They are distinct from the original team project and the original individual contributions listed above. Backend buffer unit tests are included; the updated Android implementation has not undergone a verified clean build, device test, or end-to-end validation. No measured performance improvement or zero-loss delivery guarantee is claimed.
